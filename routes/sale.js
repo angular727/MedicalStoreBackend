@@ -7,6 +7,7 @@ const Customer = require("../models/Customer");
 const CustomerLedger = require("../models/CustomerLedger");
 const auth = require("../middleware/auth");
 const { isPaged, getPageParams, pagedResponse } = require("../utils/paginate");
+const batchStock = require("../utils/batchStock");
 
 // ==========================================
 // Helper: run a transaction with auto-retry on transient
@@ -44,65 +45,206 @@ async function withTxnRetry(fn, maxRetries = 4) {
 }
 
 // ==========================================
+// HELPER: validate the sale lines, take the stock out and work out the
+// totals. Everything money-related is computed here on the server — the
+// figures the browser sends are only a preview.
+//
+// A medical store sells either a whole pack, or loose pieces out of an
+// opened pack (only when the medicine allows it), so the rate depends on
+// which of the two the counter picked.
+// ==========================================
+async function buildSaleItems(items, header, userId, session) {
+  if (!Array.isArray(items) || items.length === 0) {
+    throw new Error("Add at least one medicine to the bill");
+  }
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  let subTotal = 0;
+  let itemDiscount = 0;
+  const processed = [];
+
+  for (const item of items) {
+    if (!item.productId) throw new Error("Please select a medicine for each line");
+
+    const qty = Number(item.quantity) || 0;
+    if (qty < 1) throw new Error("Quantity cannot be less than 1");
+
+    // Scoped to this user — never touch another store's stock
+    const product = await Product.findOne({ _id: item.productId, user: userId }).session(session);
+    if (!product) throw new Error("Medicine not found on this bill");
+
+    // Make sure opening stock entered on the medicine itself is represented
+    // as a batch, otherwise it would be invisible to the batch picker
+    await batchStock.ensureOpeningBatch(product, session);
+
+    // Loose selling is only allowed when the medicine is set up for it
+    const saleUnit = item.saleUnit === "loose" ? "loose" : "pack";
+    if (saleUnit === "loose" && !(product.type === "pack" && product.looseSale)) {
+      throw new Error(`"${product.productName}" cannot be sold loose.`);
+    }
+
+    const rate = saleUnit === "loose"
+      ? Number(product.looseSalePrice || 0)
+      : Number(product.salePrice || 0);
+    if (rate <= 0) throw new Error(`"${product.productName}" has no sale rate set.`);
+
+    const unitName = saleUnit === "loose"
+      ? (product.unitLabel || "Piece")
+      : (product.type === "pack" ? (product.packLabel || "Box") : (product.unitLabel || "Piece"));
+
+    // Loose pieces still come out of whole packs, so this is what leaves stock
+    const unitsPerPack = Math.max(1, Number(product.unitsPerPack) || 1);
+    const stockUsed = saleUnit === "loose" ? qty / unitsPerPack : qty;
+
+    // Take it out of the batch that expires first (FEFO). This also refuses
+    // any batch that has already expired — expired goods never leave the counter.
+    const allocations = await batchStock.consumeFEFO({
+      productId: product._id,
+      userId,
+      quantity: stockUsed,
+      productName: product.productName,
+      today
+    }, session);
+
+    const discountPct = Number(item.discountPercent) || 0;
+    if (discountPct < 0 || discountPct > 100) throw new Error("Discount % must be between 0 and 100");
+
+    const gross = qty * rate;
+    const lineDiscount = gross * (discountPct / 100);
+    const netRate = rate - (rate * (discountPct / 100));
+    const lineTotal = gross - lineDiscount;
+
+    subTotal += gross;
+    itemDiscount += lineDiscount;
+
+    // Cost snapshot must be per unit SOLD. product.unitPrice is the cost of a
+    // whole pack, so a loose sale has to divide it down — otherwise profit on
+    // a loose line comes out wildly negative.
+    const costPerUnit = saleUnit === "loose"
+      ? (Number(product.unitPrice) || 0) / unitsPerPack
+      : (Number(product.unitPrice) || 0);
+
+    // The batch the goods mostly came from — what goes on the printed bill
+    const mainBatch = allocations[0] || {};
+
+    processed.push({
+      product: product._id,
+      productName: product.productName,
+      batchNumber: mainBatch.batchNo || "",
+      expiryDate: mainBatch.expiryDate || null,
+      batchesUsed: allocations,
+      saleUnit,
+      unitName,
+      quantity: qty,
+      salePrice: rate,
+      discountPercent: discountPct,
+      discount: lineDiscount,
+      netRate,
+      purchasePriceAtTime: costPerUnit,
+      lineTotal
+    });
+  }
+
+  const billDiscount = Number(header.discount) || 0;
+  const deliveryCharges = Number(header.deliveryCharges) || 0;
+  const grandTotal = subTotal - itemDiscount - billDiscount + deliveryCharges;
+
+  if (grandTotal < 0) throw new Error("Discount cannot be more than the bill total");
+
+  return { processed, subTotal, itemDiscount, billDiscount, deliveryCharges, grandTotal };
+}
+
+// Put back the stock a sale (or an old version of it) had taken out — into the
+// exact batches it came from, so batch quantities stay honest
+async function restoreSaleStock(saleItems, userId, session) {
+  for (const item of saleItems) {
+    if (item.batchesUsed && item.batchesUsed.length) {
+      await batchStock.restoreAllocations({
+        productId: item.product,
+        userId,
+        allocations: item.batchesUsed
+      }, session);
+      continue;
+    }
+
+    // Bills written before batches existed carry no allocation — put the
+    // quantity back as a single batch so nothing is lost
+    const product = await Product.findOne({ _id: item.product, user: userId }).session(session);
+    if (!product) continue;
+    const unitsPerPack = Math.max(1, Number(product.unitsPerPack) || 1);
+    const stockUsed = item.saleUnit === "loose" ? item.quantity / unitsPerPack : item.quantity;
+    await batchStock.addStock({
+      productId: item.product,
+      userId,
+      batchNo: item.batchNumber || "",
+      expiryDate: item.expiryDate || null,
+      quantity: stockUsed
+    }, session);
+  }
+}
+
+// ==========================================
 // 1. CREATE SALE (Sale Invoice Entry)
 // ==========================================
 router.post("/", auth, async (req, res) => {
   try {
-    const { customerId, customerName, invoiceNumber, items, discount, grandTotal, amountReceived } = req.body;
+    const { customerId, customerName, invoiceNumber, items, amountReceived } = req.body;
+    if (!invoiceNumber) throw new Error("Invoice number is required");
 
     const newSaleId = await withTxnRetry(async (session) => {
-      // A. Stock Check & Update logic
-      for (const item of items) {
-        const product = await Product.findById(item.productId).session(session);
-        if (!product) throw new Error(`Product not found: ${item.productId}`);
+      const dupe = await Sale.findOne({ invoiceNumber, user: req.user.id }).session(session);
+      if (dupe) throw new Error(`Invoice #${invoiceNumber} already exists`);
 
-        // ✅ Check currentStock (Jo ke asal warehouse stock hai)
-        if (product.currentStock < item.quantity) {
-          throw new Error(`Insufficient stock! Only ${product.currentStock} of ${product.productName} remaining.`);
-        }
+      const totals = await buildSaleItems(items, req.body, req.user.id, session);
 
-        // Decrease currentStock (this is the variable that reduces on a sale)
-        product.currentStock -= item.quantity;
-        await product.save({ session });
+      // Tolerance of a paisa, so a rounded rupee entry is not rejected
+      const received = Number(amountReceived) || 0;
+      if (received > totals.grandTotal + 0.01) throw new Error("Amount received cannot exceed the grand total");
 
-        // Store the purchase price on the item for profit tracking
-        item.purchasePriceAtTime = product.unitPrice || 0;
+      const grandTotal = totals.grandTotal;
+
+      // Take the name off the customer record when one is picked, so the bill
+      // never says "Walking Customer" for a named account
+      let billName = customerName || "Walking Customer";
+      if (customerId) {
+        const c = await Customer.findOne({ _id: customerId, user: req.user.id }).session(session);
+        if (c) billName = c.name;
       }
 
       // B. Create Sale Entry
       const newSale = new Sale({
         customer: customerId || null,
-        customerName: customerName || "Walking Customer",
+        customerName: billName,
         invoiceNumber,
-        items: items.map(i => ({
-          product: i.productId,
-          quantity: i.quantity,
-          salePrice: i.salePrice,
-          purchasePriceAtTime: i.purchasePriceAtTime,
-          lineTotal: i.lineTotal
-        })),
-        subTotal: Number(grandTotal) + Number(discount),
-        discount: Number(discount),
-        grandTotal: Number(grandTotal),
-        amountReceived: Number(amountReceived),
+        doctorName: req.body.doctorName || "",
+        prescriptionNo: req.body.prescriptionNo || "",
+        items: totals.processed,
+        subTotal: totals.subTotal,
+        itemDiscount: totals.itemDiscount,
+        discount: totals.billDiscount,
+        deliveryCharges: totals.deliveryCharges,
+        grandTotal,
+        amountReceived: received,
         user: req.user.id
       });
       await newSale.save({ session });
 
-      // C. Customer Ledger Update (Only if not walking customer)
+      // C. Customer ledger — only for a named customer, not a walk-in
       if (customerId) {
         const customer = await Customer.findOne({ _id: customerId, user: req.user.id }).session(session);
         if (customer) {
-          customer.totalSale += Number(grandTotal);
-          customer.totalPaid += Number(amountReceived);
+          customer.totalSale += grandTotal;
+          customer.totalPaid += received;
           await customer.save({ session });
 
           const ledger = new CustomerLedger({
             customer: customerId,
             transactionType: "Sale",
             description: `Invoice #${invoiceNumber}`,
-            debit: Number(grandTotal),     // Udhaar barha
-            credit: Number(amountReceived), // Paise mil gaye
+            debit: grandTotal,   // what the customer now owes
+            credit: received,    // what they paid at the counter
             runningBalance: customer.balance,
             referenceId: newSale._id,
             user: req.user.id
@@ -186,7 +328,7 @@ router.get("/:id", auth, async (req, res) => {
   try {
     const sale = await Sale.findOne({ _id: req.params.id, user: req.user.id })
       .populate("customer", "name phone address email")
-      .populate("items.product", "productName model brand");
+      .populate("items.product", "productName genericName brand category strength type unitLabel packLabel unitsPerPack looseSale looseSalePrice salePrice unitPrice currentStock sellableStock batchNo expiryDate barcode");
     
     if (!sale) return res.status(404).json({ msg: "Invoice not found" });
     res.json(sale);
@@ -232,7 +374,7 @@ router.get("/report/product/:productId", auth, async (req, res) => {
     const sales = await Sale.find({ 
       user: req.user.id, 
       "items.product": productId 
-    }).populate("items.product", "productName model brand");
+    }).populate("items.product", "productName genericName brand category strength type unitLabel packLabel unitsPerPack looseSale looseSalePrice salePrice unitPrice currentStock sellableStock batchNo expiryDate barcode");
 
     let totalQtySold = 0;
     let totalRevenue = 0;
@@ -274,33 +416,38 @@ router.put("/:id", auth, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const { customerId, customerName, invoiceNumber, items, discount, grandTotal, amountReceived } = req.body;
+    const { customerId, customerName, invoiceNumber, items, amountReceived } = req.body;
 
-    // 1. Purani Sale dhundein taake stock wapis sahi kiya ja sake
-    const oldSale = await Sale.findById(req.params.id).session(session);
+    // 1. Find the original bill so its stock effect can be reversed
+    const oldSale = await Sale.findOne({ _id: req.params.id, user: req.user.id }).session(session);
     if (!oldSale) throw new Error("Previous record not found");
 
-    // 2. REVERSE OLD STOCK: Purani items ka stock wapis plus karein
-    for (const oldItem of oldSale.items) {
-      await Product.findByIdAndUpdate(
-        oldItem.product,
-        { $inc: { currentStock: oldItem.quantity } },
-        { session }
-      );
+    // A bill that already has returns against it cannot be edited — the returns
+    // put stock back and posted their own ledger rows, so reversing this bill
+    // would count the same stock twice. Delete the returns first.
+    const SaleReturn = require("../models/SaleReturn");
+    const returnCount = await SaleReturn.countDocuments({
+      originalSale: oldSale._id, user: req.user.id
+    }).session(session);
+    if (returnCount > 0) {
+      throw new Error(`This bill has ${returnCount} return(s) against it. Delete the return(s) first, then edit the bill.`);
     }
 
-    // 3. APPLY NEW STOCK: subtract the new items' stock and run the stock check
-    for (const item of items) {
-      const product = await Product.findById(item.productId).session(session);
-      if (!product) throw new Error(`Product not found: ${item.productId}`);
+    // 2. Put the old stock back
+    await restoreSaleStock(oldSale.items, req.user.id, session);
 
-      if (product.currentStock < item.quantity) {
-        throw new Error(`Insufficient stock! Only ${product.currentStock} of ${product.productName} remaining.`);
-      }
+    // 3. Re-price and re-check the new lines, and take the new stock out
+    const totals = await buildSaleItems(items, req.body, req.user.id, session);
 
-      product.currentStock -= item.quantity;
-      await product.save({ session });
-      item.purchasePriceAtTime = product.unitPrice || 0; 
+    const received = Number(amountReceived) || 0;
+    if (received > totals.grandTotal + 0.01) throw new Error("Amount received cannot exceed the grand total");
+    const grandTotal = totals.grandTotal;
+
+    // Same here — prefer the name on the customer record
+    let billName = customerName || "Walking Customer";
+    if (customerId) {
+      const c = await Customer.findOne({ _id: customerId, user: req.user.id }).session(session);
+      if (c) billName = c.name;
     }
 
     // 4. Update Sale Document
@@ -308,25 +455,23 @@ router.put("/:id", auth, async (req, res) => {
       req.params.id,
       {
         customer: customerId || null,
-        customerName: customerName || "Walking Customer",
-        items: items.map(i => ({
-          product: i.productId,
-          quantity: i.quantity,
-          salePrice: i.salePrice,
-          purchasePriceAtTime: i.purchasePriceAtTime,
-          lineTotal: i.lineTotal
-        })),
-        subTotal: Number(grandTotal) + Number(discount),
-        discount: Number(discount),
-        grandTotal: Number(grandTotal),
-        amountReceived: Number(amountReceived),
+        customerName: billName,
+        doctorName: req.body.doctorName || "",
+        prescriptionNo: req.body.prescriptionNo || "",
+        items: totals.processed,
+        subTotal: totals.subTotal,
+        itemDiscount: totals.itemDiscount,
+        discount: totals.billDiscount,
+        deliveryCharges: totals.deliveryCharges,
+        grandTotal,
+        amountReceived: received
       },
       { new: true, session }
     );
 
     // Reverse the OLD sale's effect on the OLD customer's running totals
     if (oldSale.customer) {
-      const oldCust = await Customer.findById(oldSale.customer).session(session);
+      const oldCust = await Customer.findOne({ _id: oldSale.customer, user: req.user.id }).session(session);
       if (oldCust) {
         oldCust.totalSale -= oldSale.grandTotal;
         oldCust.totalPaid -= oldSale.amountReceived;
@@ -335,22 +480,22 @@ router.put("/:id", auth, async (req, res) => {
     }
 
     // Remove the old ledger rows tied to this invoice
-    await CustomerLedger.deleteMany({ referenceId: oldSale._id }).session(session);
+    await CustomerLedger.deleteMany({ referenceId: oldSale._id, user: req.user.id }).session(session);
 
     // Apply the NEW sale's effect on the (possibly changed) customer
     if (customerId) {
-      const newCust = await Customer.findById(customerId).session(session);
+      const newCust = await Customer.findOne({ _id: customerId, user: req.user.id }).session(session);
       if (newCust) {
-        newCust.totalSale += Number(grandTotal);
-        newCust.totalPaid += Number(amountReceived);
+        newCust.totalSale += grandTotal;
+        newCust.totalPaid += received;
         await newCust.save({ session });
 
         const ledger = new CustomerLedger({
           customer: newCust._id,
           transactionType: "Sale Update",
           description: `Updated Invoice #${invoiceNumber}`,
-          debit: Number(grandTotal),
-          credit: Number(amountReceived),
+          debit: grandTotal,
+          credit: received,
           runningBalance: newCust.balance,
           referenceId: updatedSale._id,
           user: req.user.id
@@ -431,24 +576,28 @@ router.delete("/:id", auth, async (req, res) => {
     const sale = await Sale.findOne({ _id: req.params.id, user: req.user.id }).session(session);
     if (!sale) return res.status(404).json({ msg: "Sale invoice not found" });
 
-    // 1. Add the stock back (reverse the sale)
-    for (const item of sale.items) {
-      await Product.findByIdAndUpdate(
-        item.product,
-        { $inc: { currentStock: item.quantity } },
-        { session }
-      );
+    // Returns already put this stock back and posted their own ledger rows,
+    // so voiding here would add the same stock twice. Delete the returns first.
+    const SaleReturn = require("../models/SaleReturn");
+    const returnCount = await SaleReturn.countDocuments({
+      originalSale: sale._id, user: req.user.id
+    }).session(session);
+    if (returnCount > 0) {
+      throw new Error(`This bill has ${returnCount} return(s) against it. Delete the return(s) first, then void the bill.`);
     }
 
-    // 2. Customer balance + ledger reverse karein
+    // 1. Add the stock back (reverse the sale)
+    await restoreSaleStock(sale.items, req.user.id, session);
+
+    // 2. Reverse the customer balance and ledger
     if (sale.customer) {
-      const customer = await Customer.findById(sale.customer).session(session);
+      const customer = await Customer.findOne({ _id: sale.customer, user: req.user.id }).session(session);
       if (customer) {
         customer.totalSale -= sale.grandTotal;
         customer.totalPaid -= sale.amountReceived;
         await customer.save({ session });
       }
-      await CustomerLedger.deleteMany({ referenceId: sale._id }).session(session);
+      await CustomerLedger.deleteMany({ referenceId: sale._id, user: req.user.id }).session(session);
     }
 
     // 3. Sale delete karein

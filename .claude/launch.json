@@ -1,0 +1,90 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "codinghub-next",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\Next.js\\Codinghubpro.com", "&&", "npm", "run", "dev"],
+      "port": 3000
+    },
+    {
+      "name": "patient-care-frontend",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\pateint care\\patient care\\patient care Frountend", "&&", "npx", "ng", "serve", "--port", "4203"],
+      "port": 4203
+    },
+    {
+      "name": "patient-care-backend",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\pateint care\\patient care\\patient care backend", "&&", "node", "./bin/www"],
+      "port": 6243,
+      "url": "https://localhost:6243"
+    },
+    {
+      "name": "patient-care-appointment",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\pateint care\\patient care appointment", "&&", "npx", "ng", "serve", "--port", "4205"],
+      "port": 4205
+    },
+    {
+      "name": "machine-frontend",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\AI-PROJECT\\Machine Software\\Machine", "&&", "npx", "ng", "serve", "--port", "4200"],
+      "port": 4200
+    },
+    {
+      "name": "machine-backend",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\AI-PROJECT\\Machine Software\\BACKEND", "&&", "node", "server.js"],
+      "port": 5000
+    },
+    {
+      "name": "ilahi-baksh-frontend",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\Point of Sale\\Ilahi-Baksh\\Latest ilahi baksh", "&&", "npx", "ng", "serve", "--port", "4200"],
+      "port": 4200
+    },
+    {
+      "name": "ilahi-baksh-backend",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\Point of Sale\\Ilahi-Baksh\\backend ilahi baksh", "&&", "npm", "start"],
+      "port": 5200
+    },
+    {
+      "name": "gym-frontend",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\AI-PROJECT\\GYM Software\\Gym Angular", "&&", "npx", "ng", "serve", "--port", "4210"],
+      "port": 4210
+    },
+    {
+      "name": "gym-backend",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\AI-PROJECT\\GYM Software\\Gym BACKEND", "&&", "node", "server.js"],
+      "port": 5010
+    },
+    {
+      "name": "alflah-website-frontend",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\Websites\\alflah  Website", "&&", "npx", "ng", "serve", "--port", "4220"],
+      "port": 4220
+    },
+    {
+      "name": "cms-v6-frontend",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\CMS V6\\CMC V6 LATEST\\12 august 14 06 cms web", "&&", "npx", "ng", "serve", "--port", "4230"],
+      "port": 4230
+    },
+    {
+      "name": "alflah-pos-v3",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\Alflah\\august 16 16 33 pos v3", "&&", "npx", "ng", "serve", "--port", "4201"],
+      "port": 4201
+    },
+    {
+      "name": "alflah-customer-web",
+      "runtimeExecutable": "cmd.exe",
+      "runtimeArgs": ["/c", "cd", "/d", "D:\\Alflah\\customer web", "&&", "npx", "ng", "serve", "--port", "4202"],
+      "port": 4202
+    }
+  ]
+}

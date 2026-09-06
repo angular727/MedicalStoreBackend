@@ -1,32 +1,32 @@
 const mongoose = require("mongoose");
 
-const nestedPartSchema = new mongoose.Schema({
-  product: { type: mongoose.Schema.Types.ObjectId, ref: "Product" },
-  name: String,
-  serialNumber: { type: String, required: true },
-  barcode: { type: String },
-  quantity: { type: Number, default: 1 },
-  purchasePrice: { type: Number, default: 0 }
-});
-
 const purchaseItemSchema = new mongoose.Schema({
-  product: { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
-  productType: { type: String, enum: ["machine", "part", "single"], required: true },
-  barcode: { type: String },      
-  batchNumber: { type: String },  
-  discount: { type: Number, default: 0 },
-  serialNumber: { type: String, required: true },
-  quantity: { type: Number, required: true, min: 1 },
-  purchasePrice: { type: Number, required: true },
-  sellingPrice: { type: Number, default: 0 },
-  taxPercentage: { type: Number, default: 0 },
-  lineTotal: { type: Number, required: true },
-  linkedParts: [nestedPartSchema] 
+  product:     { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
+  productType: { type: String, enum: ["single", "pack"], required: true },
+  barcode:     { type: String },
+
+  // ── Batch tracking — required for a medical store ──────────────────
+  batchNumber: { type: String, required: true },
+  expiryDate:  { type: Date, default: null },
+
+  // ── Quantity ──────────────────────────────────────────────────────
+  quantity: { type: Number, required: true, min: 1 }, // paid quantity
+  bonusQty: { type: Number, default: 0, min: 0 },     // free goods from the distributor (e.g. 10 + 1)
+
+  // ── Rates ─────────────────────────────────────────────────────────
+  purchasePrice:   { type: Number, required: true },  // invoice rate per sale unit
+  discountPercent: { type: Number, default: 0 },      // trade discount given by the distributor
+  discount:        { type: Number, default: 0 },      // discount amount for this line
+  netRate:         { type: Number, default: 0 },      // rate after the trade discount
+  sellingPrice:    { type: Number, default: 0 },      // retail rate to sell at
+  taxPercentage:   { type: Number, default: 0 },
+
+  lineTotal: { type: Number, required: true }
 });
 
 const purchaseSchema = new mongoose.Schema({
   supplier: { type: mongoose.Schema.Types.ObjectId, ref: "Supplier", required: true },
-  purchaseNumber: { type: String, required: true }, 
+  purchaseNumber: { type: String, required: true },
   date: { type: Date, default: Date.now },
   items: [purchaseItemSchema],
   subTotal: { type: Number, required: true },
@@ -38,5 +38,4 @@ const purchaseSchema = new mongoose.Schema({
   user: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true }
 }, { timestamps: true });
 
-// module.exports = mongoose.model("Purchase", purchaseSchema);
 module.exports = mongoose.models.Purchase || mongoose.model("Purchase", purchaseSchema);

@@ -16,7 +16,11 @@ router.post("/", auth, async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
   try {
-    const { name, companyName, phone, address, email, openingBalance, totalAmount, paidAmount } = req.body;
+    const {
+      name, companyName, phone, altPhone, address, city, email,
+      openingBalance, totalAmount, paidAmount,
+      supplierType, drugLicenseNo, ntn, strn, creditDays, notes
+    } = req.body;
 
     if (!name || !companyName || !phone) {
       return res.status(400).json({ msg: "Name, Company Name, and Phone are required fields" });
@@ -31,8 +35,16 @@ router.post("/", auth, async (req, res) => {
       name,
       companyName,
       phone,
+      altPhone,
       address,
+      city,
       email,
+      supplierType: supplierType || "Distributor",
+      drugLicenseNo,
+      ntn,
+      strn,
+      creditDays: Number(creditDays) || 0,
+      notes,
       openingBalance: initialOpening,
       totalPurchase: initialPurchase,
       totalPaid: initialPaid,
@@ -102,7 +114,9 @@ router.get("/", auth, async (req, res) => {
       query.$or = [
         { name:        { $regex: search, $options: "i" } },
         { companyName: { $regex: search, $options: "i" } },
-        { phone:       { $regex: search, $options: "i" } }
+        { phone:         { $regex: search, $options: "i" } },
+        { city:          { $regex: search, $options: "i" } },
+        { drugLicenseNo: { $regex: search, $options: "i" } }
       ];
     }
 
@@ -153,14 +167,27 @@ router.put("/:id", auth, async (req, res) => {
     if (!supplier) return res.status(404).json({ msg: "Supplier not found" });
 
     // Profile updates (avoiding direct balance/ledger override here to keep integrity)
-    const { name, companyName, phone, address, email, status } = req.body;
-    
+    const {
+      name, companyName, phone, altPhone, address, city, email, status,
+      supplierType, drugLicenseNo, ntn, strn, creditDays, notes
+    } = req.body;
+
     if (name) supplier.name = name;
     if (companyName) supplier.companyName = companyName;
     if (phone) supplier.phone = phone;
-    if (address !== undefined) supplier.address = address;
-    if (email !== undefined) supplier.email = email;
     if (status) supplier.status = status;
+    if (supplierType) supplier.supplierType = supplierType;
+
+    // Optional text fields — an empty string is a valid "clear this"
+    if (altPhone !== undefined) supplier.altPhone = altPhone;
+    if (address !== undefined) supplier.address = address;
+    if (city !== undefined) supplier.city = city;
+    if (email !== undefined) supplier.email = email;
+    if (drugLicenseNo !== undefined) supplier.drugLicenseNo = drugLicenseNo;
+    if (ntn !== undefined) supplier.ntn = ntn;
+    if (strn !== undefined) supplier.strn = strn;
+    if (notes !== undefined) supplier.notes = notes;
+    if (creditDays !== undefined) supplier.creditDays = Number(creditDays) || 0;
 
     await supplier.save();
     res.json(supplier);

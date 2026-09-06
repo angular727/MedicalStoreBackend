@@ -3,9 +3,19 @@ const mongoose = require("mongoose");
 const saleReturnItemSchema = new mongoose.Schema({
   product:     { type: mongoose.Schema.Types.ObjectId, ref: "Product", required: true },
   productName: { type: String, default: "" },
-  quantity:    { type: Number, required: true, min: 1 },
-  salePrice:   { type: Number, required: true, min: 0 },
-  lineTotal:   { type: Number, required: true }
+
+  // Batch details carried over from the sale line
+  batchNumber: { type: String, default: "" },
+  expiryDate:  { type: Date, default: null },
+
+  // Whether the customer bought a whole pack or loose pieces
+  saleUnit: { type: String, enum: ["pack", "loose"], default: "pack" },
+  unitName: { type: String, default: "" },
+
+  quantity:  { type: Number, required: true, min: 1 },
+  salePrice: { type: Number, required: true, min: 0 },  // rate charged on the bill
+  netRate:   { type: Number, default: 0 },              // rate after the line discount — refunded at this
+  lineTotal: { type: Number, required: true }
 }, { _id: false });
 
 const saleReturnSchema = new mongoose.Schema({

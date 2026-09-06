@@ -7,6 +7,7 @@ const Product = require("../models/Product");
 const Supplier = require("../models/supplier");
 const SupplierLedger = require("../models/SupplierLedger");
 const auth = require("../middleware/auth");
+const batchStock = require("../utils/batchStock");
 
 async function withTxnRetry(fn, maxRetries = 4) {
   let attempt = 0;
@@ -68,29 +69,50 @@ router.post("/", auth, async (req, res) => {
         const purItem = purchase.items.find(pi => pi.product.toString() === String(reqItem.productId));
         if (!purItem) throw new Error("A returned item does not belong to this purchase");
 
-        const purchasedQty = purItem.quantity;
+        // Bonus/free pieces were delivered too, so they can be sent back as well
+        const paidPurchased = purItem.quantity;
+        const bonusPurchased = purItem.bonusQty || 0;
+        const receivedQty = paidPurchased + bonusPurchased;
+
         const priorQty = alreadyReturned[String(reqItem.productId)] || 0;
-        if (qty + priorQty > purchasedQty) {
-          throw new Error(`Return quantity exceeds purchased quantity. Purchased: ${purchasedQty}, already returned: ${priorQty}.`);
+        if (qty + priorQty > receivedQty) {
+          throw new Error(`Return quantity exceeds what was received. Received: ${receivedQty} (${paidPurchased} paid + ${bonusPurchased} free), already returned: ${priorQty}.`);
         }
 
-        // Reduce stock — must have enough on hand (else it was already sold)
+        // Take it out of the very batch this bill brought in — that is the
+        // stock physically going back to the distributor
         const product = await Product.findOne({ _id: reqItem.productId, user: req.user.id }).session(session);
-        if (!product) throw new Error("Product not found for return");
-        if ((product.currentStock || 0) < qty) {
-          throw new Error(`Not enough stock of "${product.productName}" to return. In stock: ${product.currentStock || 0}, trying to return: ${qty}.`);
-        }
-        product.currentStock -= qty;
-        await product.save({ session });
+        if (!product) throw new Error("Medicine not found for return");
 
-        const lineTotal = qty * purItem.purchasePrice;
+        await batchStock.removeStock({
+          productId: product._id,
+          userId: req.user.id,
+          quantity: qty,
+          batchNo: purItem.batchNumber,
+          expiryDate: purItem.expiryDate,
+          productName: product.productName
+        }, session);
+
+        // Returns are applied to the paid pieces first, free pieces last.
+        // Only paid pieces earn a credit, and at the discounted (net) rate the
+        // distributor actually charged.
+        const paidQty = Math.max(0, Math.min(priorQty + qty, paidPurchased) - Math.min(priorQty, paidPurchased));
+        const freeQty = qty - paidQty;
+
+        const netRate = purItem.netRate || purItem.purchasePrice;
+        const lineTotal = paidQty * netRate;
         totalAmount += lineTotal;
 
         returnItems.push({
           product: reqItem.productId,
           productName: reqItem.productName || product.productName,
+          batchNumber: purItem.batchNumber || "",
+          expiryDate: purItem.expiryDate || null,
           quantity: qty,
+          paidQty,
+          freeQty,
           purchasePrice: purItem.purchasePrice,
+          netRate,
           lineTotal
         });
       }
@@ -176,6 +198,48 @@ router.get("/purchase/:purchaseId", auth, async (req, res) => {
     res.json({ returnedByProduct });
   } catch (err) {
     res.status(500).json({ msg: err.message });
+  }
+});
+
+// ==========================================
+// 4. DELETE A PURCHASE RETURN (undo)
+// Puts the returned stock back, restores the supplier payable and removes
+// the ledger entry. Needed before a bill with returns can be edited or voided.
+// ==========================================
+router.delete("/:id", auth, async (req, res) => {
+  try {
+    await withTxnRetry(async (session) => {
+      const ret = await PurchaseReturn.findOne({ _id: req.params.id, user: req.user.id }).session(session);
+      if (!ret) throw new Error("Purchase return not found");
+
+      // Put the stock back into the batch it left from
+      for (const item of ret.items) {
+        const product = await Product.findOne({ _id: item.product, user: req.user.id }).session(session);
+        if (!product) continue;
+        await batchStock.addStock({
+          productId: product._id,
+          userId: req.user.id,
+          batchNo: item.batchNumber || "",
+          expiryDate: item.expiryDate || null,
+          quantity: item.quantity
+        }, session);
+      }
+
+      // Restore what we owe the supplier
+      const supplier = await Supplier.findOne({ _id: ret.supplier, user: req.user.id }).session(session);
+      if (supplier) {
+        supplier.totalPurchase += ret.totalAmount;
+        await supplier.save({ session });
+      }
+
+      await SupplierLedger.deleteMany({ referenceId: ret._id, user: req.user.id }).session(session);
+      await ret.deleteOne({ session });
+    });
+
+    res.json({ msg: "Purchase return deleted and stock restored" });
+  } catch (err) {
+    console.error("Delete purchase return error:", err.message);
+    res.status(500).json({ msg: err.message || "Failed to delete purchase return" });
   }
 });
 

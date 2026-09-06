@@ -16,7 +16,16 @@ const supplierSchema = new mongoose.Schema({
     required: [true, "Phone number is required"],
     trim: true
   },
+  // Second number — usually the order-booker's mobile or a WhatsApp number
+  altPhone: {
+    type: String,
+    trim: true
+  },
   address: {
+    type: String,
+    trim: true
+  },
+  city: {
     type: String,
     trim: true
   },
@@ -31,7 +40,25 @@ const supplierSchema = new mongoose.Schema({
     enum: ["Active", "Inactive"],
     default: "Active"
   },
-  
+
+  // ── Who you are buying from ───────────────────────────────────────
+  supplierType: {
+    type: String,
+    enum: ["Distributor", "Manufacturer", "Wholesaler", "Sub-Distributor", "Other"],
+    default: "Distributor"
+  },
+
+  // ── Licence & tax details a medical store has to keep on record ───
+  drugLicenseNo: { type: String, trim: true },  // Drug Sale Licence number
+  ntn:           { type: String, trim: true },  // National Tax Number
+  strn:          { type: String, trim: true },  // Sales Tax Registration Number
+
+  // Agreed credit period in days (0 = cash only)
+  creditDays: { type: Number, default: 0, min: 0 },
+
+  notes: { type: String, trim: true },
+
+
   // Ledger accounting fields
   openingBalance: {
     type: Number,

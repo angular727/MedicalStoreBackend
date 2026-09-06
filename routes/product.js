@@ -3,8 +3,9 @@ const router  = express.Router();
 const Product = require("../models/Product");
 const auth    = require("../middleware/auth");
 const { isPaged, getPageParams, pagedResponse } = require("../utils/paginate");
+const batchStock = require("../utils/batchStock");
 
-// Chota unique 4-digit product code banata hai (per user), collision par retry
+// Generates a short unique 4-digit product code per user, retrying on collision
 async function generateProductCode(userId) {
   for (let i = 0; i < 15; i++) {
     const code = String(Math.floor(1000 + Math.random() * 9000));
@@ -14,90 +15,81 @@ async function generateProductCode(userId) {
   return String(Date.now()).slice(-6); // fallback
 }
 
+// Normalizes and validates the product body (used by both POST and PUT).
+// Returns an error string, or null when everything is valid.
+function normalizeProductBody(body) {
+  // Sale unit: single (by the piece) or pack (whole box)
+  if (!body.type || !["single", "pack"].includes(body.type)) {
+    return "Product type must be 'single' or 'pack'.";
+  }
+
+  if (body.unitPrice == null || body.salePrice == null) {
+    return "Purchase price and sale price are both required.";
+  }
+
+  body.unitPrice    = Number(body.unitPrice);
+  body.salePrice    = Number(body.salePrice);
+  body.initialStock = body.initialStock != null ? Number(body.initialStock) : 0;
+  body.minStock     = body.minStock != null ? Number(body.minStock) : null;
+
+  if (isNaN(body.unitPrice) || isNaN(body.salePrice)) {
+    return "Purchase price and sale price must be valid numbers.";
+  }
+
+  // ── Packing ───────────────────────────────────────────
+  if (body.type === "pack") {
+    body.unitsPerPack = Number(body.unitsPerPack);
+    if (!body.unitsPerPack || body.unitsPerPack < 1) {
+      return "Units per pack is required for a pack (e.g. 1 box = 10 tablets).";
+    }
+
+    body.looseSale = !!body.looseSale;
+    if (body.looseSale) {
+      if (body.looseSalePrice == null) {
+        return "Loose sale price is required when loose selling is allowed.";
+      }
+      body.looseSalePrice = Number(body.looseSalePrice);
+    } else {
+      body.looseSalePrice = null;
+    }
+  } else {
+    // Single item — the pack fields do not apply
+    body.unitsPerPack   = 1;
+    body.looseSale      = false;
+    body.looseSalePrice = null;
+  }
+
+  // Cast the expiry date to a Date
+  if (body.expiryDate) {
+    const exp = new Date(body.expiryDate);
+    if (isNaN(exp.getTime())) return "Expiry date is not valid.";
+    body.expiryDate = exp;
+  } else {
+    body.expiryDate = null;
+  }
+
+  return null;
+}
+
 // ── POST /api/product ─────────────────────────────────────────────────────
 router.post("/", auth, async (req, res) => {
   try {
     const body = req.body;
 
-    // Type check
-    if (!body.type || !["single", "machine"].includes(body.type)) {
-      return res.status(400).json({ msg: "Invalid product type." });
-    }
+    const invalid = normalizeProductBody(body);
+    if (invalid) return res.status(400).json({ msg: invalid });
 
-    // manufacturingYear always String
-    if (body.manufacturingYear != null) {
-      body.manufacturingYear = String(body.manufacturingYear);
-    }
-
-    // ── Single Part ───────────────────────────────────────
-// Purana "if (body.type === 'single')" wala block hata kar yeh wala paste karein:
-    
-    if (body.type === "single") {
-      if (body.unitPrice == null) {
-        return res.status(400).json({
-          msg: "unitPrice is required for single part."
-        });
-      }
-
-      body.unitPrice    = Number(body.unitPrice);
-      body.initialStock = body.initialStock != null ? Number(body.initialStock) : 0;
-      body.minStock     = body.minStock != null ? Number(body.minStock) : null;
-
-      // ✅ YEH 2 LINES ADD KI HAIN (Zaroori hain):
-      body.currentStock = body.initialStock; // Shuru ka stock set karne ke liye
-      body.purchasePrice = body.unitPrice;   // Shuru ki qeemat set karne ke liye
-
-      // Machine fields hatao (Yeh wahi purana code hai)
-      body.parts       = [];
-      body.serialNo    = "";
-      body.condition   = "";
-      body.accessories = "";
-      body.printerType = "";
-    }
-
-    // ── Machine ───────────────────────────────────────────
-    if (body.type === "machine") {
-      if (!body.serialNo || !body.condition) {
-        return res.status(400).json({
-          msg: "serialNo and condition are required for machine."
-        });
-      }
-
-      if (!Array.isArray(body.parts) || body.parts.length === 0) {
-        return res.status(400).json({
-          msg: "At least one part is required for machine."
-        });
-      }
-
-      // Har part validate aur cast karo
-      for (let i = 0; i < body.parts.length; i++) {
-        const p = body.parts[i];
-
-        if (!p.name || !p.sku || p.qty == null || p.unitCost == null) {
-          return res.status(400).json({
-            msg: `Row ${i + 1}: name, sku, qty, unitCost are all required.`
-          });
-        }
-
-        body.parts[i] = {
-          name:     String(p.name),
-          sku:      String(p.sku),
-          qty:      Number(p.qty),
-          unitCost: Number(p.unitCost),
-          serialNo: p.serialNo ? String(p.serialNo) : ""
-        };
-      }
-
-      // Single fields hatao
-      body.unitPrice    = null;
-      body.initialStock = null;
-      body.minStock     = null;
-    }
+    body.currentStock  = body.initialStock; // Seed the opening stock
+    body.purchasePrice = body.unitPrice;    // Seed the opening price
 
     body.productCode = await generateProductCode(req.user.id);
 
     const product = new Product({ ...body, user: req.user.id });
     await product.save();
+
+    // Opening stock becomes the medicine's first batch, so it is visible to
+    // the batch picker, the expiry report and the stock screen
+    await batchStock.ensureOpeningBatch(product);
 
     res.status(201).json(product);
 
@@ -116,9 +108,40 @@ router.post("/", auth, async (req, res) => {
 // ── GET /api/product ──────────────────────────────────────────────────────
 router.get("/", auth, async (req, res) => {
   try {
-    const { search, admin, type } = req.query;
+    const { search, admin, type, filter } = req.query;
 
-    // Admin: apne + baaki sab users ka data (role check)
+    // The four views a medical store opens every morning
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const in90Days = new Date(today);
+    in90Days.setDate(in90Days.getDate() + 90);
+
+    // Expiry views come from the batch ledger — a medicine counts as expired
+    // when it is holding an expired batch, whatever its newest batch says
+    const StockBatch = require("../models/StockBatch");
+    const withExpiredBatch = async () => StockBatch.distinct("product", {
+      user: req.user.id, quantity: { $gt: 0 },
+      expiryDate: { $ne: null, $lt: today }
+    });
+    const withNearExpiryBatch = async () => StockBatch.distinct("product", {
+      user: req.user.id, quantity: { $gt: 0 },
+      expiryDate: { $ne: null, $gte: today, $lte: in90Days }
+    });
+
+    const [expiredIds, nearExpIds] = await Promise.all([withExpiredBatch(), withNearExpiryBatch()]);
+
+    const VIEWS = {
+      expired:  { _id: { $in: expiredIds } },
+      nearexp:  { _id: { $in: nearExpIds } },
+      lowstock: { $expr: { $and: [
+        { $ne: ["$minStock", null] },
+        { $gt: ["$currentStock", 0] },
+        { $lte: ["$currentStock", "$minStock"] }
+      ] } },
+      outofstock: { currentStock: { $lte: 0 } }
+    };
+
+    // Admin: their own data plus every other user (role check)
     let userFilter = { user: req.user.id };
     if (admin === "true" && req.user.role === "admin") {
       userFilter = {};
@@ -129,33 +152,47 @@ router.get("/", auth, async (req, res) => {
     if (search) {
       searchFilter.$or = [
         { productName: { $regex: search, $options: "i" } },
-        { model:       { $regex: search, $options: "i" } },
+        { genericName: { $regex: search, $options: "i" } },
         { brand:       { $regex: search, $options: "i" } },
+        { category:    { $regex: search, $options: "i" } },
+        { batchNo:     { $regex: search, $options: "i" } },
         { barcode:     search }
       ];
     }
 
-    // Full query = user + search + (optional) type
+    // Full query = user + search + (optional) type + (optional) view
     let query = { ...userFilter, ...searchFilter };
-    if (type === "machine" || type === "single") query.type = type;
+    if (type === "pack" || type === "single") query.type = type;
+    if (VIEWS[filter]) query = { ...query, ...VIEWS[filter] };
+
+    // Expiring stock first when looking at an expiry view, newest otherwise
+    const sortBy = (filter === "expired" || filter === "nearexp")
+      ? { expiryDate: 1 }
+      : { createdAt: -1 };
 
     if (!isPaged(req)) {
-      const products = await Product.find(query).sort({ createdAt: -1 });
+      const products = await Product.find(query).sort(sortBy);
       return res.json(products);
     }
 
-    // Paginated response with tab counts (counts ignore the type filter)
+    // Paginated response with tab counts (counts ignore the active view)
     const { page, limit, skip } = getPageParams(req);
     const countBase = { ...userFilter, ...searchFilter };
-    const [data, total, all, machine, single] = await Promise.all([
-      Product.find(query).sort({ createdAt: -1 }).skip(skip).limit(limit),
+    const [data, total, all, pack, single, expired, nearexp, lowstock, outofstock] = await Promise.all([
+      Product.find(query).sort(sortBy).skip(skip).limit(limit),
       Product.countDocuments(query),
       Product.countDocuments(countBase),
-      Product.countDocuments({ ...countBase, type: "machine" }),
-      Product.countDocuments({ ...countBase, type: "single" })
+      Product.countDocuments({ ...countBase, type: "pack" }),
+      Product.countDocuments({ ...countBase, type: "single" }),
+      Product.countDocuments({ ...countBase, ...VIEWS.expired }),
+      Product.countDocuments({ ...countBase, ...VIEWS.nearexp }),
+      Product.countDocuments({ ...countBase, ...VIEWS.lowstock }),
+      Product.countDocuments({ ...countBase, ...VIEWS.outofstock })
     ]);
 
-    res.json(pagedResponse(data, total, page, limit, { all, machine, single }));
+    res.json(pagedResponse(data, total, page, limit, {
+      all, pack, single, expired, nearexp, lowstock, outofstock
+    }));
   } catch (err) {
     console.error("GET /product error:", err.message);
     res.status(500).json({ msg: err.message || "Server Error: Fetch failed" });
@@ -169,19 +206,11 @@ router.put("/:id", auth, async (req, res) => {
   try {
     const body = req.body;
 
-    if (body.manufacturingYear != null) {
-      body.manufacturingYear = String(body.manufacturingYear);
-    }
+    const invalid = normalizeProductBody(body);
+    if (invalid) return res.status(400).json({ msg: invalid });
 
-    if (body.type === "machine" && Array.isArray(body.parts)) {
-      body.parts = body.parts.map((p) => ({
-        name:     String(p.name),
-        sku:      String(p.sku),
-        qty:      Number(p.qty),
-        unitCost: Number(p.unitCost),
-        serialNo: p.serialNo ? String(p.serialNo) : ""
-      }));
-    }
+    // Never overwrite currentStock on edit — purchase/sale own that value
+    delete body.currentStock;
 
     const updated = await Product.findOneAndUpdate(
       { _id: req.params.id, user: req.user.id },
@@ -214,19 +243,46 @@ router.get("/:id/batches", auth, async (req, res) => {
     .populate("supplier", "name companyName")
     .sort({ date: -1 });
 
-    const result = batches.map(p => {
+    // What each delivery brought in
+    const history = batches.map(p => {
       const item = p.items.find(i => i.product?.toString() === req.params.id);
       return {
-        batchNumber: p.purchaseNumber,
+        batchNumber: item?.batchNumber || "—",   // the real batch printed on the pack
+        expiryDate: item?.expiryDate || null,
+        invoiceNumber: p.purchaseNumber,
         date: p.date,
         supplier: p.supplier?.name || "—",
-        quantity: item?.quantity || 0,
+        quantity: (item?.quantity || 0) + (item?.bonusQty || 0),
+        bonusQty: item?.bonusQty || 0,
         purchasePrice: item?.purchasePrice || 0,
-        serialNumber: item?.serialNumber || "—"
+        netRate: item?.netRate || item?.purchasePrice || 0
       };
     });
 
-    res.json(result);
+    // What is actually left of each batch, nearest expiry first — this is the
+    // question a medical store really asks
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const day = 1000 * 60 * 60 * 24;
+
+    const live = (await batchStock.listBatches(req.params.id, req.user.id)).map(b => {
+      const daysLeft = b.expiryDate
+        ? Math.ceil((new Date(b.expiryDate).getTime() - today.getTime()) / day)
+        : null;
+      return {
+        _id: b._id,
+        batchNo: b.batchNo || "—",
+        expiryDate: b.expiryDate,
+        daysLeft,
+        status: daysLeft === null ? "No expiry"
+          : (daysLeft < 0 ? "Expired" : (daysLeft <= 90 ? "Near expiry" : "Good")),
+        quantity: b.quantity,
+        purchaseRate: b.purchaseRate,
+        value: b.quantity * (b.purchaseRate || 0)
+      };
+    });
+
+    res.json({ live, history });
   } catch (err) {
     res.status(500).json({ msg: err.message });
   }
@@ -254,6 +310,29 @@ router.post("/:id/adjust-stock", auth, async (req, res) => {
         return res.status(400).json({ msg: "Stock quantity must be a valid number (0 or more)." });
       }
       if (newStock !== prevStock) {
+        // Push the difference through the batch ledger so batches and the
+        // total never disagree. A count-up lands in the current batch; a
+        // count-down comes off nearest-expiry first.
+        await batchStock.ensureOpeningBatch(product);
+        const diff = newStock - prevStock;
+        if (diff > 0) {
+          await batchStock.addStock({
+            productId: product._id,
+            userId: req.user.id,
+            batchNo: product.batchNo || "ADJUSTED",
+            expiryDate: product.expiryDate || null,
+            quantity: diff,
+            purchaseRate: product.unitPrice,
+            salePrice: product.salePrice
+          });
+        } else {
+          await batchStock.removeStock({
+            productId: product._id,
+            userId: req.user.id,
+            quantity: -diff,
+            productName: product.productName
+          });
+        }
         product.currentStock = newStock;
         logs.push({
           product: product._id,

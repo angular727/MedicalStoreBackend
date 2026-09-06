@@ -3,36 +3,87 @@ const router = express.Router();
 const mongoose = require("mongoose");
 const Customer = require("../models/Customer");
 const CustomerLedger = require("../models/CustomerLedger");
+const Sale = require("../models/Sale");
 const auth = require("../middleware/auth");
 const { isPaged, getPageParams, pagedResponse } = require("../utils/paginate");
+
+// ==========================================
+// Helper: run a transaction with auto-retry on transient
+// MongoDB conflicts ("Write conflict ... yielding is disabled").
+// Same pattern as routes/sale.js — Atlas shared tiers throw these
+// intermittently and retry is the officially recommended handling.
+// ==========================================
+async function withTxnRetry(fn, maxRetries = 4) {
+  let attempt = 0;
+  while (true) {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+    try {
+      const result = await fn(session);
+      await session.commitTransaction();
+      session.endSession();
+      return result;
+    } catch (err) {
+      try { await session.abortTransaction(); } catch (e) {}
+      session.endSession();
+
+      const labels = err.errorLabels || [];
+      const transient = labels.includes("TransientTransactionError") ||
+                        labels.includes("UnknownTransactionCommitResult");
+      const writeConflict = err.code === 112 || /write conflict/i.test(err.message || "");
+
+      if ((transient || writeConflict) && attempt < maxRetries) {
+        attempt++;
+        await new Promise(r => setTimeout(r, 60 * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+}
 
 // ==========================================
 // 1. ADD NEW CUSTOMER
 // ==========================================
 router.post("/", auth, async (req, res) => {
   try {
-    const { name, phone, address, email, openingBalance, isWalking } = req.body;
+    const {
+      name, phone, address, city, email, openingBalance, isWalking,
+      customerType, age, gender, allergies, conditions, creditLimit, notes
+    } = req.body;
+
+    // Normalize once — an absent opening balance used to become NaN and then
+    // blew up the ledger entry below, so a customer could not be saved at all
+    const opening = Number(openingBalance) || 0;
 
     const customer = new Customer({
       name,
       phone,
       address,
+      city,
       email,
-      openingBalance: Number(openingBalance) || 0,
+      openingBalance: opening,
       isWalking,
+      customerType: customerType || (isWalking ? "Walk-in" : "Regular"),
+      age: age !== undefined && age !== null && age !== "" ? Number(age) : null,
+      gender: gender || "",
+      allergies: allergies || "",
+      conditions: conditions || "",
+      creditLimit: Number(creditLimit) || 0,
+      notes: notes || "",
       user: req.user.id
     });
 
     const savedCustomer = await customer.save();
 
-    if (Number(openingBalance) !== 0) {
+    if (opening !== 0) {
       const ledgerEntry = new CustomerLedger({
         customer: savedCustomer._id,
         transactionType: "Opening Balance",
         description: "Initial Balance at time of registration",
-        debit: Number(openingBalance) > 0 ? Number(openingBalance) : 0,
-        credit: Number(openingBalance) < 0 ? Math.abs(Number(openingBalance)) : 0,
-        runningBalance: Number(openingBalance),
+        debit: opening > 0 ? opening : 0,
+        credit: opening < 0 ? Math.abs(opening) : 0,
+        runningBalance: opening,
         user: req.user.id
       });
       await ledgerEntry.save();
@@ -55,7 +106,8 @@ router.get("/", auth, async (req, res) => {
       query.$or = [
         { name:  { $regex: search, $options: "i" } },
         { phone: { $regex: search, $options: "i" } },
-        { email: { $regex: search, $options: "i" } }
+        { email: { $regex: search, $options: "i" } },
+        { city:  { $regex: search, $options: "i" } }
       ];
     }
 
@@ -100,12 +152,20 @@ router.get("/:id", auth, async (req, res) => {
 // ==========================================
 router.put("/:id", auth, async (req, res) => {
   try {
-    const { name, phone, address, email, isWalking } = req.body;
-    
-    // Sirf wahi cheezein update hongi jo ledger ko kharab nahi karti
+    const {
+      name, phone, address, city, email, isWalking,
+      customerType, age, gender, allergies, conditions, creditLimit, notes
+    } = req.body;
+
+    // Only profile fields are updatable here — balances belong to the ledger
+    const fields = { name, phone, address, city, email, isWalking, customerType, gender, allergies, conditions, notes };
+    if (age !== undefined) fields.age = (age === "" || age === null) ? null : Number(age);
+    if (creditLimit !== undefined) fields.creditLimit = Number(creditLimit) || 0;
+    Object.keys(fields).forEach(k => fields[k] === undefined && delete fields[k]);
+
     const updatedCustomer = await Customer.findOneAndUpdate(
       { _id: req.params.id, user: req.user.id },
-      { $set: { name, phone, address, email, isWalking } },
+      { $set: fields },
       { new: true }
     );
 
@@ -122,34 +182,91 @@ router.put("/:id", auth, async (req, res) => {
 router.post("/payment", auth, async (req, res) => {
   try {
     const { customerId, amount, note, transactionType, date } = req.body;
-    const customer = await Customer.findById(customerId);
-    if (!customer) return res.status(404).json({ msg: "Customer not found" });
-
     const amt = Number(amount);
+    if (!amt || amt <= 0) throw new Error("Amount must be greater than 0");
     const type = transactionType || "Payment";
+    const txnDate = date ? new Date(date) : new Date();
 
-    if (type === "Payment") {
-      // Customer ne paisa diya → totalPaid barha → balance kama
+    const currentBalance = await withTxnRetry(async (session) => {
+      const customer = await Customer.findOne({ _id: customerId, user: req.user.id }).session(session);
+      if (!customer) throw new Error("Customer not found");
+
+      if (type !== "Payment") {
+        // Naya udhaar diya (on account, not tied to a specific invoice) → totalSale barha
+        customer.totalSale += amt;
+        await customer.save({ session });
+
+        await new CustomerLedger({
+          customer: customerId,
+          transactionType: type,
+          description: note || "Credit Sale / Udhaar",
+          debit: amt,
+          credit: 0,
+          runningBalance: customer.balance,
+          date: txnDate,
+          user: req.user.id
+        }).save({ session });
+
+        return customer.balance;
+      }
+
+      // Customer ne paisa diya → sabse pehle uske purane (oldest) pending
+      // invoices par apply karein (FIFO), taake har Sale ka amountReceived —
+      // aur is se Sales History ka Received/Balance Due — hamesha sync rahe.
       customer.totalPaid += amt;
-    } else if (type === "Sale") {
-      // Naya udhaar diya → totalSale barha → balance barha
-      customer.totalSale += amt;
-    }
-    await customer.save();
+      await customer.save({ session });
 
-    const ledger = new CustomerLedger({
-      customer: customerId,
-      transactionType: type,
-      description: note || (type === "Payment" ? "Cash/Bank Received" : "Credit Sale / Udhaar"),
-      debit:  type === "Sale"    ? amt : 0,
-      credit: type === "Payment" ? amt : 0,
-      runningBalance: customer.balance,
-      date: date ? new Date(date) : new Date(),
-      user: req.user.id
+      let remaining = amt;
+      const openSales = await Sale.find({
+        customer: customerId,
+        user: req.user.id,
+        $expr: { $lt: ["$amountReceived", "$grandTotal"] }
+      }).sort({ createdAt: 1 }).session(session);
+
+      for (const sale of openSales) {
+        if (remaining <= 0) break;
+        const due = sale.grandTotal - sale.amountReceived;
+        if (due <= 0) continue;
+        const applied = Math.min(due, remaining);
+
+        sale.amountReceived += applied;
+        await sale.save({ session });
+        remaining -= applied;
+
+        await new CustomerLedger({
+          customer: customerId,
+          transactionType: "Payment",
+          description: note
+            ? `${note} — Invoice #${sale.invoiceNumber}`
+            : `Payment received against Invoice #${sale.invoiceNumber}`,
+          debit: 0,
+          credit: applied,
+          runningBalance: customer.balance,
+          referenceId: sale._id,
+          date: txnDate,
+          user: req.user.id
+        }).save({ session });
+      }
+
+      // Sab invoices settle hone ke baad bhi kuch bache to woh general
+      // advance/on-account credit hai, kisi ek invoice se linked nahi.
+      if (remaining > 0) {
+        await new CustomerLedger({
+          customer: customerId,
+          transactionType: "Payment",
+          description: note || "Cash/Bank Received (Advance)",
+          debit: 0,
+          credit: remaining,
+          runningBalance: customer.balance,
+          date: txnDate,
+          user: req.user.id
+        }).save({ session });
+      }
+
+      return customer.balance;
     });
-    await ledger.save();
 
-    res.json({ msg: "Transaction recorded", currentBalance: customer.balance });
+    res.json({ msg: "Transaction recorded", currentBalance });
   } catch (err) {
     res.status(500).json({ msg: err.message });
   }

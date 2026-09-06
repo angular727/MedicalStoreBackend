@@ -7,6 +7,7 @@ const Product = require("../models/Product");
 const Customer = require("../models/Customer");
 const CustomerLedger = require("../models/CustomerLedger");
 const auth = require("../middleware/auth");
+const batchStock = require("../utils/batchStock");
 
 // Transaction helper with retry on transient Atlas write-conflicts
 async function withTxnRetry(fn, maxRetries = 4) {
@@ -75,21 +76,63 @@ router.post("/", auth, async (req, res) => {
           throw new Error(`Return quantity exceeds sold quantity. Sold: ${soldQty}, already returned: ${priorQty}.`);
         }
 
-        const lineTotal = qty * saleItem.salePrice;
+        // Refund at the rate actually charged, i.e. after any line discount
+        const netRate = saleItem.netRate || saleItem.salePrice;
+        const lineTotal = qty * netRate;
         totalAmount += lineTotal;
 
-        // Restore stock
+        // Put the stock back into the batch it was sold from. Loose pieces came
+        // out of a pack, so they go back as a fraction of one.
         const product = await Product.findOne({ _id: reqItem.productId, user: req.user.id }).session(session);
         if (product) {
-          product.currentStock = (product.currentStock || 0) + qty;
-          await product.save({ session });
+          const unitsPerPack = Math.max(1, Number(product.unitsPerPack) || 1);
+          const stockBack = saleItem.saleUnit === "loose" ? qty / unitsPerPack : qty;
+
+          // Give the goods back to the batches this line was sold from, in the
+          // order they were taken. Filling the nearest-expiry batch first keeps
+          // whole packs whole (a proportional split would hand back 1.33 of a
+          // box) and puts the soonest-expiring stock back on the shelf to sell
+          // again first.
+          const used = (saleItem.batchesUsed || []).map(u => (u.toObject ? u.toObject() : u));
+
+          if (used.length) {
+            const allocations = [];
+            let left = stockBack;
+            for (const u of used) {
+              if (left <= 0) break;
+              const give = Math.min(u.quantity, left);
+              allocations.push({ ...u, quantity: give });
+              left -= give;
+            }
+            // Anything still left (the line was edited since) goes to the first batch
+            if (left > 0 && allocations.length) allocations[0].quantity += left;
+
+            await batchStock.restoreAllocations({
+              productId: product._id,
+              userId: req.user.id,
+              allocations
+            }, session);
+          } else {
+            await batchStock.addStock({
+              productId: product._id,
+              userId: req.user.id,
+              batchNo: saleItem.batchNumber || "",
+              expiryDate: saleItem.expiryDate || null,
+              quantity: stockBack
+            }, session);
+          }
         }
 
         returnItems.push({
           product: reqItem.productId,
-          productName: reqItem.productName || (product ? product.productName : ""),
+          productName: saleItem.productName || reqItem.productName || (product ? product.productName : ""),
+          batchNumber: saleItem.batchNumber || "",
+          expiryDate: saleItem.expiryDate || null,
+          saleUnit: saleItem.saleUnit || "pack",
+          unitName: saleItem.unitName || "",
           quantity: qty,
           salePrice: saleItem.salePrice,
+          netRate,
           lineTotal
         });
       }
@@ -176,6 +219,56 @@ router.get("/sale/:saleId", auth, async (req, res) => {
     res.json({ returnedByProduct });
   } catch (err) {
     res.status(500).json({ msg: err.message });
+  }
+});
+
+// ==========================================
+// 4. DELETE A SALE RETURN (undo)
+// Takes the returned stock back out, restores the customer receivable and
+// removes the ledger row. Needed before a bill with returns can be edited
+// or voided.
+// ==========================================
+router.delete("/:id", auth, async (req, res) => {
+  try {
+    await withTxnRetry(async (session) => {
+      const ret = await SaleReturn.findOne({ _id: req.params.id, user: req.user.id }).session(session);
+      if (!ret) throw new Error("Sale return not found");
+
+      // Take the stock back out — the goods go back to the customer
+      for (const item of ret.items) {
+        const product = await Product.findOne({ _id: item.product, user: req.user.id }).session(session);
+        if (!product) continue;
+
+        const unitsPerPack = Math.max(1, Number(product.unitsPerPack) || 1);
+        const stockBack = item.saleUnit === "loose" ? item.quantity / unitsPerPack : item.quantity;
+
+        await batchStock.removeStock({
+          productId: product._id,
+          userId: req.user.id,
+          quantity: stockBack,
+          batchNo: item.batchNumber,
+          expiryDate: item.expiryDate,
+          productName: product.productName
+        }, session);
+      }
+
+      // Restore what the customer owes
+      if (ret.customer) {
+        const customer = await Customer.findOne({ _id: ret.customer, user: req.user.id }).session(session);
+        if (customer) {
+          customer.totalSale += ret.totalAmount;
+          await customer.save({ session });
+        }
+      }
+
+      await CustomerLedger.deleteMany({ referenceId: ret._id, user: req.user.id }).session(session);
+      await ret.deleteOne({ session });
+    });
+
+    res.json({ msg: "Sale return deleted and stock adjusted" });
+  } catch (err) {
+    console.error("Delete sale return error:", err.message);
+    res.status(500).json({ msg: err.message || "Failed to delete sale return" });
   }
 });
 

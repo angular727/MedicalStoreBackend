@@ -7,6 +7,7 @@ const Supplier = require("../models/supplier");
 const SupplierLedger = require("../models/SupplierLedger");
 const auth = require("../middleware/auth");
 const { isPaged, getPageParams, pagedResponse } = require("../utils/paginate");
+const batchStock = require("../utils/batchStock");
 
 // ==========================================
 // Helper: transaction with auto-retry on transient MongoDB
@@ -40,8 +41,13 @@ async function withTxnRetry(fn, maxRetries = 4) {
 }
 
 // ==========================================
-// HELPER: Items se totals + processedItems nikalna
-// (Create aur Update dono route mein use hoga, isliye alag kar diya)
+// HELPER: turn the submitted items into stored items + invoice totals
+// (shared by the create and update routes)
+//
+// Medical store line maths:
+//   gross    = quantity x purchase rate
+//   discount = gross x trade discount %
+//   net line = gross - discount   (bonus/free goods cost nothing)
 // ==========================================
 function buildItemsAndTotals(items, header) {
   if (!Array.isArray(items) || items.length === 0) {
@@ -53,41 +59,96 @@ function buildItemsAndTotals(items, header) {
   const processedItems = [];
 
   for (const item of items) {
-    if (!item.productId) throw new Error("Please select a product for each item");
+    if (!item.productId) throw new Error("Please select a medicine for each item");
     if (!item.quantity || item.quantity < 1) throw new Error("Quantity cannot be less than 1");
+    if (!item.batchNumber) throw new Error("Batch number is required for every medicine");
 
     const qty = Number(item.quantity);
+    const bonusQty = Number(item.bonusQty) || 0;
     const unitCost = Number(item.unitCost) || 0;
     const sellingPrice = Number(item.unitPriceText) || 0;
-    const discount = Number(item.discount) || 0;
+    const discountPct = Number(item.discountPercent) || 0;
     const taxPct = Number(item.taxPercentage) || 0;
 
-    const lineSub = (qty * unitCost) - discount;
+    if (bonusQty < 0) throw new Error("Bonus quantity cannot be negative");
+    if (discountPct < 0 || discountPct > 100) throw new Error("Discount % must be between 0 and 100");
+
+    const gross = qty * unitCost;
+    const discount = gross * (discountPct / 100);
+    const netRate = unitCost - (unitCost * (discountPct / 100));
+
+    const lineSub = gross - discount;
     const lineTax = lineSub * (taxPct / 100);
     const lineTotal = lineSub + lineTax;
 
     subtotal += lineSub;
     totalTax += lineTax;
 
+    let expiryDate = null;
+    if (item.expiryDate) {
+      const exp = new Date(item.expiryDate);
+      if (isNaN(exp.getTime())) throw new Error("Expiry date is not valid");
+      expiryDate = exp;
+    }
+
     processedItems.push({
       product: item.productId,
-      productType: item.type,
+      productType: item.type === "pack" ? "pack" : "single",
       barcode: item.barcode,
-      batchNumber: header.invoiceNumber, // Invoice Number ko hi Batch Number bana diya
-      serialNumber: item.serialNumber,
+      batchNumber: String(item.batchNumber),
+      expiryDate: expiryDate,
       quantity: qty,
+      bonusQty: bonusQty,
       purchasePrice: unitCost,
+      discountPercent: discountPct,
+      discount: discount,
+      netRate: netRate,
       sellingPrice: sellingPrice,
       taxPercentage: taxPct,
-      discount: discount,
-      lineTotal: lineTotal,
-      linkedParts: item.linkedParts || []
+      lineTotal: lineTotal
     });
   }
 
   const deliveryCharges = Number(header.deliveryCharges) || 0;
   const grandTotal = subtotal + totalTax + deliveryCharges;
   return { subtotal, totalTax, deliveryCharges, grandTotal, processedItems };
+}
+
+// Applies one purchase line: the goods land in their own batch, and the
+// medicine's sale rate and barcode are refreshed. Bonus/free goods land in
+// stock too even though they were not paid for.
+// batchStock keeps Product.currentStock in step with the batch rows.
+async function applyItemToProduct(productDoc, item, purchaseId, session) {
+  if (item.sellingPrice && Number(item.sellingPrice) > 0) {
+    productDoc.salePrice = item.sellingPrice;
+  }
+  if (item.barcode) productDoc.barcode = item.barcode;
+  await productDoc.save({ session });
+
+  await batchStock.addStock({
+    productId: productDoc._id,
+    userId: productDoc.user,
+    batchNo: item.batchNumber,
+    expiryDate: item.expiryDate,
+    quantity: item.quantity + (item.bonusQty || 0),
+    purchaseRate: item.netRate || item.purchasePrice,
+    salePrice: item.sellingPrice,
+    purchaseId
+  }, session);
+}
+
+// Takes a purchase line's goods back out — used when a bill is edited or voided
+async function reverseItemFromProduct(item, userId, session) {
+  const stockedQty = item.quantity + (item.bonusQty || 0);
+  const product = await Product.findOne({ _id: item.product, user: userId }).session(session);
+  await batchStock.removeStock({
+    productId: item.product,
+    userId,
+    quantity: stockedQty,
+    batchNo: item.batchNumber,
+    expiryDate: item.expiryDate,
+    productName: product ? product.productName : ""
+  }, session);
 }
 
 // ==========================================
@@ -115,15 +176,10 @@ router.post("/", auth, async (req, res) => {
       const paid = Number(amountPaid) || 0;
       if (paid > grandTotal) throw new Error("Amount Paid cannot exceed Grand Total");
 
-      // Stock update + product existence check
+      // Every medicine on the bill must exist before anything is written
       for (const item of processedItems) {
-        const productDoc = await Product.findOne({ _id: item.product, user: req.user.id }).session(session);
-        if (!productDoc) throw new Error(`Product not found (ID: ${item.product})`);
-
-        productDoc.currentStock = (productDoc.currentStock || 0) + item.quantity;
-        productDoc.unitPrice = item.purchasePrice;
-        if (item.barcode) productDoc.barcode = item.barcode;
-        await productDoc.save({ session });
+        const exists = await Product.findOne({ _id: item.product, user: req.user.id }).session(session);
+        if (!exists) throw new Error(`Medicine not found (ID: ${item.product})`);
       }
 
       const newPurchase = new Purchase({
@@ -140,6 +196,12 @@ router.post("/", auth, async (req, res) => {
       });
 
       await newPurchase.save({ session });
+
+      // Goods in — each line lands in its own batch, tagged with this bill
+      for (const item of processedItems) {
+        const productDoc = await Product.findOne({ _id: item.product, user: req.user.id }).session(session);
+        await applyItemToProduct(productDoc, item, newPurchase._id, session);
+      }
 
       // --- Supplier & Ledger ---
       supplierDoc.totalPurchase += grandTotal;
@@ -201,7 +263,7 @@ router.get("/", auth, async (req, res) => {
     if (!isPaged(req)) {
       const purchases = await Purchase.find(userFilter)
         .populate("supplier", "name companyName phone")
-        .populate("items.product", "productName model brand type unitPrice barcode")
+        .populate("items.product", "productName genericName brand category strength type unitLabel packLabel unitsPerPack unitPrice salePrice barcode")
         .sort({ date: -1 });
       return res.json(purchases);
     }
@@ -211,7 +273,7 @@ router.get("/", auth, async (req, res) => {
     const [data, total, agg] = await Promise.all([
       Purchase.find(userFilter)
         .populate("supplier", "name companyName phone")
-        .populate("items.product", "productName model brand type unitPrice barcode")
+        .populate("items.product", "productName genericName brand category strength type unitLabel packLabel unitsPerPack unitPrice salePrice barcode")
         .sort({ date: -1 }).skip(skip).limit(limit),
       Purchase.countDocuments(userFilter),
       Purchase.aggregate([
@@ -236,7 +298,7 @@ router.get("/", auth, async (req, res) => {
 router.get("/supplier/:supplierId", auth, async (req, res) => {
   try {
     const purchases = await Purchase.find({ supplier: req.params.supplierId, user: req.user.id })
-      .populate("items.product", "productName model brand type unitPrice barcode")
+      .populate("items.product", "productName genericName brand category strength type unitLabel packLabel unitsPerPack unitPrice salePrice barcode")
       .sort({ date: -1 });
     res.json(purchases);
   } catch (err) {
@@ -251,7 +313,7 @@ router.get("/:id", auth, async (req, res) => {
   try {
     const purchase = await Purchase.findOne({ _id: req.params.id, user: req.user.id })
       .populate("supplier", "name companyName phone address email")
-      .populate("items.product", "productName model brand type unitPrice barcode");
+      .populate("items.product", "productName genericName brand category strength type unitLabel packLabel unitsPerPack unitPrice salePrice barcode");
 
     if (!purchase) {
       return res.status(404).json({ msg: "Purchase invoice not found" });
@@ -283,6 +345,17 @@ router.put("/:id", auth, async (req, res) => {
     const oldPurchase = await Purchase.findOne({ _id: req.params.id, user: req.user.id }).session(session);
     if (!oldPurchase) throw new Error("Purchase record not found");
 
+    // A bill that already has returns against it cannot be edited — the returns
+    // are separate documents with their own stock and ledger effects, and
+    // reversing this bill would double-count them. Delete the returns first.
+    const PurchaseReturn = require("../models/PurchaseReturn");
+    const returnCount = await PurchaseReturn.countDocuments({
+      originalPurchase: oldPurchase._id, user: req.user.id
+    }).session(session);
+    if (returnCount > 0) {
+      throw new Error(`This bill has ${returnCount} return(s) against it. Delete the return(s) first, then edit the bill.`);
+    }
+
     const oldSupplierDoc = await Supplier.findOne({ _id: oldPurchase.supplier, user: req.user.id }).session(session);
     if (!oldSupplierDoc) throw new Error("Previous supplier record not found");
 
@@ -296,14 +369,7 @@ router.put("/:id", auth, async (req, res) => {
 
     // ---------- STEP 1: REVERSE THE OLD STOCK EFFECT ----------
     for (const oldItem of oldPurchase.items) {
-      const productDoc = await Product.findOne({ _id: oldItem.product, user: req.user.id }).session(session);
-      if (productDoc) {
-        if ((productDoc.currentStock || 0) < oldItem.quantity) {
-          throw new Error(`Stock for "${productDoc.productName}" has already been sold, so this purchase cannot be edited. Please adjust the related sale first.`);
-        }
-        productDoc.currentStock -= oldItem.quantity;
-        await productDoc.save({ session });
-      }
+      await reverseItemFromProduct(oldItem, req.user.id, session);
     }
 
     // ---------- STEP 2: PURANA SUPPLIER & LEDGER EFFECT REVERSE KARO ----------
@@ -325,15 +391,12 @@ router.put("/:id", auth, async (req, res) => {
     const paid = Number(amountPaid) || 0;
     if (paid > grandTotal) throw new Error("Amount Paid cannot exceed Grand Total");
 
-    // ---------- STEP 5: NAYA STOCK EFFECT APPLY KARO ----------
+    // ---------- STEP 5: APPLY THE NEW STOCK EFFECT ----------
     for (const item of processedItems) {
       const productDoc = await Product.findOne({ _id: item.product, user: req.user.id }).session(session);
-      if (!productDoc) throw new Error(`Product not found (ID: ${item.product})`);
+      if (!productDoc) throw new Error(`Medicine not found (ID: ${item.product})`);
 
-      productDoc.currentStock = (productDoc.currentStock || 0) + item.quantity;
-      productDoc.unitPrice = item.purchasePrice;
-      if (item.barcode) productDoc.barcode = item.barcode;
-      await productDoc.save({ session });
+      await applyItemToProduct(productDoc, item, oldPurchase._id, session);
     }
 
     // ---------- STEP 6: PURCHASE DOCUMENT UPDATE KARO ----------
@@ -396,19 +459,20 @@ router.delete("/:id", auth, async (req, res) => {
       throw new Error("Supplier linked to this purchase was not found");
     }
 
-    // 1. Stock Check & Rollback
-    for (const item of purchase.items) {
-      const productDoc = await Product.findOne({ _id: item.product, user: req.user.id }).session(session);
-      if (productDoc) {
-        // If the stock has already been sold, deletion is not allowed
-        if (productDoc.currentStock < item.quantity) {
-          throw new Error(`Stock for product "${productDoc.productName}" has already been sold. Please delete the sale first or adjust the stock.`);
-        }
+    // A bill with returns against it cannot be voided — those returns already
+    // took stock out and posted their own ledger entries, so voiding here would
+    // remove the same stock twice. Delete the returns first.
+    const PurchaseReturn = require("../models/PurchaseReturn");
+    const returnCount = await PurchaseReturn.countDocuments({
+      originalPurchase: purchase._id, user: req.user.id
+    }).session(session);
+    if (returnCount > 0) {
+      throw new Error(`This bill has ${returnCount} return(s) against it. Delete the return(s) first, then void the bill.`);
+    }
 
-        // Reduce the stock back
-        productDoc.currentStock -= item.quantity;
-        await productDoc.save({ session });
-      }
+    // 1. Stock rollback — throws if the goods have since been sold
+    for (const item of purchase.items) {
+      await reverseItemFromProduct(item, req.user.id, session);
     }
 
     // 2. Rollback supplier values
