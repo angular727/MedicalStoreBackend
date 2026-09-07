@@ -52,6 +52,36 @@ async function connectDB() {
   return cachedConnection;
 }
 
+// ---------- Temporary diagnostic ----------
+// Reports the SHAPE of MONGO_URI, never the secret itself, so a mismatch
+// between the local .env and the deployed environment can be pinpointed.
+// Sits above the connect middleware so it answers even when the DB is down.
+// Remove once the deployment is confirmed working.
+app.get("/api/_diag", (req, res) => {
+  const crypto = require("crypto");
+  const uri = process.env.MONGO_URI;
+  if (!uri) return res.json({ mongoUri: "MISSING", jwtSecretSet: !!process.env.JWT_SECRET });
+
+  const m = uri.match(/^mongodb(\+srv)?:\/\/([^:]+):([^@]+)@([^/?]+)\/([^?]*)/);
+  if (!m) {
+    return res.json({ mongoUri: "UNPARSEABLE", length: uri.length, startsWith: uri.slice(0, 20) });
+  }
+
+  const pwd = m[3];
+  res.json({
+    length: uri.length,
+    srv: !!m[1],
+    username: m[2],
+    passwordLength: pwd.length,
+    // Hash, not the password — lets us compare against local without exposing it
+    passwordSha256: crypto.createHash("sha256").update(pwd).digest("hex").slice(0, 12),
+    host: m[4],
+    database: m[5] || "(none)",
+    hasWhitespace: /\s/.test(uri),
+    jwtSecretSet: !!process.env.JWT_SECRET
+  });
+});
+
 // Har request se pehle connection guaranteed complete honi chahiye
 app.use(async (req, res, next) => {
   try {

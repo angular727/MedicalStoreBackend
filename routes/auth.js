@@ -30,7 +30,9 @@ router.post("/login", async (req, res) => {
   const { username, password } = req.body;
 
   try {
-    const user = await User.findOne({ username });
+    // Trim the username — a trailing space typed into the login box was
+    // reaching the query as "admin " and failing to match
+    const user = await User.findOne({ username: String(username || "").trim() });
     if (!user) return res.status(400).json({ msg: "Invalid username or password" });
 
     const isMatch = await bcrypt.compare(password, user.password);
