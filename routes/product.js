@@ -220,7 +220,40 @@ router.put("/:id", auth, async (req, res) => {
 
     if (!updated) return res.status(404).json({ msg: "Product not found." });
 
-    res.json(updated);
+    // Keep the batch ledger in step with the master record.
+    //
+    // Editing a medicine used to change only the Product document, so its
+    // batch number and expiry drifted away from the batch actually holding the
+    // stock — the expiry views read the ledger and called a medicine expired
+    // while the list showed the newer date typed on the form.
+    //
+    // Only opening stock is touched. A batch that came in on a purchase
+    // carries the batch number printed on the pack, and editing the medicine
+    // master must never rewrite that history.
+    const StockBatch = require("../models/StockBatch");
+    const batches = await StockBatch.find({ product: updated._id, user: req.user.id });
+    const opening = batches.filter(b => !b.purchase);
+
+    if (batches.length === opening.length && opening.length === 1) {
+      const b = opening[0];
+      const newBatchNo = updated.batchNo || "";
+      const newExpiry  = updated.expiryDate || null;
+      const changed =
+        b.batchNo !== newBatchNo ||
+        String(b.expiryDate || "") !== String(newExpiry || "");
+
+      if (changed) {
+        b.batchNo = newBatchNo;
+        b.expiryDate = newExpiry;
+        await b.save();
+      }
+    }
+
+    // Recompute totals and re-point the master record at its live batch, so
+    // currentStock, sellableStock and the shown expiry always agree
+    const synced = (await batchStock.syncProduct(updated._id, req.user.id)) || updated;
+
+    res.json(synced);
   } catch (err) {
     console.error("PUT /product error:", err.message);
     if (err.name === "ValidationError") {
